@@ -1,0 +1,245 @@
+import requests
+import urllib3
+import time
+import csv
+import json
+import os
+from datetime import datetime, UTC
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+BASE_URL = "https://127.0.0.1:2999/liveclientdata"
+POLL_INTERVAL = 5
+
+session = requests.Session()
+session.verify = False
+
+timeline_rows = []
+events_seen = set()
+events = []
+
+match_info = {}
+players_metadata = []
+
+debug_game_detected = False
+
+
+def get(endpoint):
+    try:
+        r = session.get(f"{BASE_URL}/{endpoint}", timeout=2)
+        if r.status_code == 200:
+            return r.json()
+    except:
+        return None
+
+
+def wait_for_game():
+    print("Waiting for game...")
+    while True:
+        data = get("gamestats")
+        if data:
+            print("Game detected")
+            return
+        time.sleep(2)
+
+
+def collect_metadata():
+    global debug_game_detected
+    global match_info
+    global players_metadata
+
+    data = get("allgamedata")
+
+    if not data:
+        return
+
+    if not debug_game_detected:
+
+        map_name = data.get("gameData", {}).get("mapName", "Unknown")
+        players = [p.get("summonerName", "Unknown") for p in data.get("allPlayers", [])]
+
+        print("\n=== GAME DETECTED ===")
+        print(f"Map: {map_name}")
+        print(f"Players detected ({len(players)}):")
+
+        for p in players:
+            print(f" - {p}")
+
+        print("=====================\n")
+
+        debug_game_detected = True
+
+    match_info = {
+        "map": data.get("gameData", {}).get("mapName"),
+        "mode": data.get("gameData", {}).get("gameMode"),
+        "start_time": datetime.now(UTC).isoformat()
+    }
+
+    players_metadata = []
+
+    for p in data.get("allPlayers", []):
+        players_metadata.append({
+            "summonerName": p.get("summonerName"),
+            "team": p.get("team"),
+            "champion": p.get("championName")
+        })
+
+
+def collect_snapshot():
+    data = get("allgamedata")
+
+    if not data:
+        return
+
+    game_time = data.get("gameData", {}).get("gameTime", 0)
+
+    for p in data.get("allPlayers", []):
+
+        scores = p.get("scores", {})
+
+        items = []
+
+        for item in p.get("items", []):
+            items.append(item.get("displayName"))
+
+        timeline_rows.append({
+
+            "timestamp": game_time,
+            "player": p.get("summonerName"),
+            "team": p.get("team"),
+            "champion": p.get("championName"),
+
+            "level": p.get("level"),
+
+            "kills": scores.get("kills"),
+            "deaths": scores.get("deaths"),
+            "assists": scores.get("assists"),
+            "cs": scores.get("creepScore"),
+
+            "items": "|".join(items)
+
+        })
+
+
+def collect_events():
+    data = get("eventdata")
+
+    if not data:
+        return
+
+    for e in data.get("Events", []):
+
+        key = (e.get("EventName"), e.get("EventTime"), e.get("KillerName"))
+
+        if key not in events_seen:
+            events_seen.add(key)
+            events.append(e)
+
+
+def game_running():
+    return get("gamestats") is not None
+
+
+def create_match_folder():
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    folder = f"scrim_{timestamp}"
+
+    os.makedirs(folder, exist_ok=True)
+
+    return folder
+
+
+def export_timeline(folder):
+    file = os.path.join(folder, "player_timeline.csv")
+
+    keys = [
+        "timestamp",
+        "player",
+        "team",
+        "champion",
+        "level",
+        "kills",
+        "deaths",
+        "assists",
+        "cs",
+        "items"
+    ]
+
+    with open(file, "w", newline="", encoding="utf-8") as f:
+
+        writer = csv.DictWriter(f, fieldnames=keys)
+
+        writer.writeheader()
+        writer.writerows(timeline_rows)
+
+    print("Saved timeline")
+
+
+def export_events(folder):
+    if not events:
+        return
+
+    file = os.path.join(folder, "events.csv")
+
+    keys = set()
+
+    for e in events:
+        keys.update(e.keys())
+
+    keys = sorted(keys)
+
+    with open(file, "w", newline="", encoding="utf-8") as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=keys,
+            extrasaction="ignore"
+        )
+
+        writer.writeheader()
+        writer.writerows(events)
+
+    print("Saved events")
+
+
+def export_metadata(folder):
+    data = {
+        "match": match_info,
+        "players": players_metadata
+    }
+
+    file = os.path.join(folder, "metadata.json")
+
+    with open(file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    print("Saved metadata")
+
+
+def run():
+    wait_for_game()
+
+    collect_metadata()
+
+    print("Collecting match data...")
+
+    while game_running():
+
+        collect_snapshot()
+        collect_events()
+
+        time.sleep(POLL_INTERVAL)
+
+    print("Game ended")
+
+    folder = create_match_folder()
+
+    export_timeline(folder)
+    export_events(folder)
+    export_metadata(folder)
+
+    print("Match data saved in:", folder)
+
+
+if __name__ == "__main__":
+    run()
