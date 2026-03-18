@@ -23,6 +23,23 @@ players_metadata = []
 
 debug_game_detected = False
 
+# Events the API actually fires reliably on Summoner's Rift.
+# Dragon/Baron/Herald kills are NOT exposed by this API - they are absent
+# from the /eventdata endpoint entirely. Turret and inhibitor kills do fire.
+KNOWN_WORKING_EVENTS = {
+    "GameStart",
+    "MinionsSpawning",
+    "FirstBlood",
+    "ChampionKill",
+    "Multikill",
+    "Ace",
+    "TurretKilled",
+    "InhibKilled",
+    "InhibRespawningSoon",
+    "InhibRespawned",
+    "GameEnd",
+}
+
 
 def get(endpoint):
     try:
@@ -69,19 +86,39 @@ def collect_metadata():
 
         debug_game_detected = True
 
+    game_data = data.get("gameData", {})
+
     match_info = {
-        "map": data.get("gameData", {}).get("mapName"),
-        "mode": data.get("gameData", {}).get("gameMode"),
+        "map": game_data.get("mapName"),
+        "mode": game_data.get("gameMode"),
+        # mapTerrain reflects the elemental rift type (Infernal, Ocean, Mountain, Hextech, Chemtech, Default)
+        "map_terrain": game_data.get("mapTerrain"),
         "start_time": datetime.now(UTC).isoformat()
     }
 
     players_metadata = []
 
     for p in data.get("allPlayers", []):
+        runes = p.get("runes", {})
+        spells = p.get("summonerSpells", {})
+
         players_metadata.append({
             "summonerName": p.get("summonerName"),
+            "riotId": p.get("riotId"),
             "team": p.get("team"),
-            "champion": p.get("championName")
+            "champion": p.get("championName"),
+            "is_bot": p.get("isBot"),
+            # position is assigned by the client (TOP/JUNGLE/MIDDLE/BOTTOM/UTILITY)
+            # may be empty string early in the game before roles are detected
+            "position": p.get("position"),
+            # runes: only keystone + primary/secondary trees are exposed for all players
+            # full rune pages are only available for the active (local) player
+            "keystone": runes.get("keystone", {}).get("displayName"),
+            "primary_rune_tree": runes.get("primaryRuneTree", {}).get("displayName"),
+            "secondary_rune_tree": runes.get("secondaryRuneTree", {}).get("displayName"),
+            # summoner spells
+            "summoner_spell_1": spells.get("summonerSpellOne", {}).get("displayName"),
+            "summoner_spell_2": spells.get("summonerSpellTwo", {}).get("displayName"),
         })
 
 
@@ -97,27 +134,43 @@ def collect_snapshot():
 
         scores = p.get("scores", {})
 
+        # Capture full item data per slot: id and count allow precise build tracking
+        # (component rushes, stacking items like Mejai's, build order over time).
+        # Stored as JSON so the CSV remains a single column but is still parseable.
         items = []
-
         for item in p.get("items", []):
-            items.append(item.get("displayName"))
+            items.append({
+                "id": item.get("itemID"),
+                "name": item.get("displayName"),
+                "slot": item.get("slot"),
+                "count": item.get("count"),
+            })
 
         timeline_rows.append({
-
             "timestamp": game_time,
             "player": p.get("summonerName"),
             "team": p.get("team"),
             "champion": p.get("championName"),
+            "position": p.get("position"),
 
             "level": p.get("level"),
+            # isDead and respawnTimer are useful for correlating deaths with objective timings
+            "is_dead": p.get("isDead"),
+            "respawn_timer": p.get("respawnTimer"),
 
             "kills": scores.get("kills"),
             "deaths": scores.get("deaths"),
             "assists": scores.get("assists"),
             "cs": scores.get("creepScore"),
+            # wardScore accumulates vision score over the game
+            "ward_score": scores.get("wardScore"),
 
-            "items": "|".join(items)
+            # NOTE: currentGold is only available for the active (local) player via
+            # /activeplayer. It is NOT present in allPlayers. In spectator mode this
+            # field will always be absent here. Kept as a placeholder for awareness.
+            # To capture it for a single player: get("activeplayer").get("currentGold")
 
+            "items": json.dumps(items)
         })
 
 
@@ -128,7 +181,6 @@ def collect_events():
         return
 
     for e in data.get("Events", []):
-
         key = (e.get("EventName"), e.get("EventTime"), e.get("KillerName"))
 
         if key not in events_seen:
@@ -157,18 +209,20 @@ def export_timeline(folder):
         "player",
         "team",
         "champion",
+        "position",
         "level",
+        "is_dead",
+        "respawn_timer",
         "kills",
         "deaths",
         "assists",
         "cs",
+        "ward_score",
         "items"
     ]
 
     with open(file, "w", newline="", encoding="utf-8") as f:
-
         writer = csv.DictWriter(f, fieldnames=keys)
-
         writer.writeheader()
         writer.writerows(timeline_rows)
 
@@ -182,20 +236,17 @@ def export_events(folder):
     file = os.path.join(folder, "events.csv")
 
     keys = set()
-
     for e in events:
         keys.update(e.keys())
 
     keys = sorted(keys)
 
     with open(file, "w", newline="", encoding="utf-8") as f:
-
         writer = csv.DictWriter(
             f,
             fieldnames=keys,
             extrasaction="ignore"
         )
-
         writer.writeheader()
         writer.writerows(events)
 
@@ -224,10 +275,8 @@ def run():
     print("Collecting match data...")
 
     while game_running():
-
         collect_snapshot()
         collect_events()
-
         time.sleep(POLL_INTERVAL)
 
     print("Game ended")
