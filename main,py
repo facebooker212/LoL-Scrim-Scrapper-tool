@@ -18,13 +18,15 @@ timeline_rows = []
 events_seen = set()
 events = []
 
+last_game_time = None
+
 match_info = {}
 players_metadata = []
 
 debug_game_detected = False
 
 # Events the API actually fires reliably on Summoner's Rift.
-# Dragon/Baron/Herald kills are NOT exposed by this API - they are absent
+# Dragon/Baron/Herald kills are NOT exposed by this API — they are absent
 # from the /eventdata endpoint entirely. Turret and inhibitor kills do fire.
 KNOWN_WORKING_EVENTS = {
     "GameStart",
@@ -71,17 +73,14 @@ def collect_metadata():
         return
 
     if not debug_game_detected:
-
         map_name = data.get("gameData", {}).get("mapName", "Unknown")
         players = [p.get("summonerName", "Unknown") for p in data.get("allPlayers", [])]
 
         print("\n=== GAME DETECTED ===")
         print(f"Map: {map_name}")
         print(f"Players detected ({len(players)}):")
-
         for p in players:
             print(f" - {p}")
-
         print("=====================\n")
 
         debug_game_detected = True
@@ -93,7 +92,9 @@ def collect_metadata():
         "mode": game_data.get("gameMode"),
         # mapTerrain reflects the elemental rift type (Infernal, Ocean, Mountain, Hextech, Chemtech, Default)
         "map_terrain": game_data.get("mapTerrain"),
-        "start_time": datetime.now(UTC).isoformat()
+        "start_time": datetime.now(UTC).isoformat(),
+        # winner is populated at game end via determine_winner()
+        "winner": None,
     }
 
     players_metadata = []
@@ -123,6 +124,8 @@ def collect_metadata():
 
 
 def collect_snapshot():
+    global last_game_time
+
     data = get("allgamedata")
 
     if not data:
@@ -130,8 +133,13 @@ def collect_snapshot():
 
     game_time = data.get("gameData", {}).get("gameTime", 0)
 
-    for p in data.get("allPlayers", []):
+    # If gameTime hasn't advanced the game is paused — skip to avoid duplicate rows
+    if game_time == last_game_time:
+        return
 
+    last_game_time = game_time
+
+    for p in data.get("allPlayers", []):
         scores = p.get("scores", {})
 
         # Capture full item data per slot: id and count allow precise build tracking
@@ -167,8 +175,7 @@ def collect_snapshot():
 
             # NOTE: currentGold is only available for the active (local) player via
             # /activeplayer. It is NOT present in allPlayers. In spectator mode this
-            # field will always be absent here. Kept as a placeholder for awareness.
-            # To capture it for a single player: get("activeplayer").get("currentGold")
+            # field will always be absent here.
 
             "items": json.dumps(items)
         })
@@ -188,6 +195,61 @@ def collect_events():
             events.append(e)
 
 
+def determine_winner():
+    """
+    Extract the winning team from collected events.
+
+    Strategy 1 — GameEnd event with a Recipient field.
+      The Live Client Data API fires a GameEnd event. Community reports suggest
+      it may carry a 'Recipient' field with the winning team. We attempt this first
+      and log all GameEnd fields so the format can be verified and improved.
+
+    Strategy 2 — Infer from the last turret destroyed.
+      The nexus is the last structure destroyed before GameEnd. The final
+      TurretKilled event's turret name encodes the owning team (TChaos/TOrder),
+      so the destroying team (opposite) is the winner.
+
+    Returns 'ORDER', 'CHAOS', or None if undetermined.
+    """
+    game_end_events = [e for e in events if e.get("EventName") == "GameEnd"]
+
+    # Strategy 1: inspect GameEnd fields
+    if game_end_events:
+        ge = game_end_events[-1]
+
+        # Log everything so we can see exactly what the API returns
+        print(f"[GameEnd fields]: {list(ge.keys())}")
+        print(f"[GameEnd data]:   {ge}")
+
+        recipient = ge.get("Recipient")
+        if recipient in ("ORDER", "CHAOS"):
+            print(f"[Winner via GameEnd.Recipient]: {recipient}")
+            return recipient
+
+        # Some versions may use 'Result' or other keys — log them for future use
+        for key in ("Result", "Winner", "WinningTeam"):
+            val = ge.get(key)
+            if val:
+                print(f"[GameEnd.{key}]: {val} (not used yet — update determine_winner if reliable)")
+
+    # Strategy 2: last turret killed = nexus, infer winner from turret ownership
+    turret_events = [e for e in events if e.get("EventName") == "TurretKilled"]
+
+    if turret_events:
+        last_turret = turret_events[-1]
+        turret_name = last_turret.get("TurretKilled", "")
+
+        if "TChaos" in turret_name:
+            print(f"[Winner via last turret ({turret_name})]: ORDER")
+            return "ORDER"
+        elif "TOrder" in turret_name:
+            print(f"[Winner via last turret ({turret_name})]: CHAOS")
+            return "CHAOS"
+
+    print("[Winner]: Could not determine — no GameEnd fields or turret name matched.")
+    return None
+
+
 def game_running():
     return get("gamestats") is not None
 
@@ -195,9 +257,7 @@ def game_running():
 def create_match_folder():
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
     folder = f"scrim_{timestamp}"
-
     os.makedirs(folder, exist_ok=True)
-
     return folder
 
 
@@ -242,11 +302,7 @@ def export_events(folder):
     keys = sorted(keys)
 
     with open(file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=keys,
-            extrasaction="ignore"
-        )
+        writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(events)
 
@@ -279,7 +335,24 @@ def run():
         collect_events()
         time.sleep(POLL_INTERVAL)
 
-    print("Game ended")
+    # Final flush — poll one last time immediately after the game ends.
+    # The game loop exits when game_running() returns False, but the API may
+    # still have a few events (including GameEnd) available for a brief window.
+    # We attempt up to 3 quick polls to catch anything the loop missed.
+    print("Game ended — flushing final events...")
+    for _ in range(3):
+        collect_events()
+        import time as _t; _t.sleep(0.5)
+
+    print("Determining winner...")
+
+    winner = determine_winner()
+    match_info["winner"] = winner
+
+    if winner:
+        print(f"Winner: {winner}")
+    else:
+        print("Winner could not be determined automatically.")
 
     folder = create_match_folder()
 
