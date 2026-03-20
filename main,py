@@ -8,6 +8,15 @@ from datetime import datetime, UTC
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Minimap tracker is optional - only activated if minimap_tracker.py is present
+# alongside this script. Set ENABLE_MINIMAP_TRACKER = False to disable entirely.
+ENABLE_MINIMAP_TRACKER = True
+try:
+    from minimap_tracker import MinimapTracker
+    _minimap_available = True
+except ImportError:
+    _minimap_available = False
+
 BASE_URL = "https://127.0.0.1:2999/liveclientdata"
 POLL_INTERVAL = 5
 
@@ -328,6 +337,20 @@ def run():
 
     collect_metadata()
 
+    # Start minimap tracker in background if available
+    tracker = None
+    if ENABLE_MINIMAP_TRACKER and _minimap_available:
+        champions = [
+            {"name": p.get("champion", ""), "team": p.get("team", "unknown")}
+            for p in players_metadata
+        ]
+        # Folder not created yet - tracker will create its own temp folder and
+        # we move the file after the game ends when the final folder is known.
+        tracker = MinimapTracker(folder="_minimap_temp", champions=champions)
+        tracker.start()
+    elif ENABLE_MINIMAP_TRACKER:
+        print("[main] minimap_tracker.py not found - skipping minimap tracking.")
+
     print("Collecting match data...")
 
     while game_running():
@@ -359,6 +382,20 @@ def run():
     export_timeline(folder)
     export_events(folder)
     export_metadata(folder)
+
+    # Stop minimap tracker and move its output into the final match folder
+    if tracker is not None:
+        tracker.stop()
+        src = os.path.join("_minimap_temp", "minimap_positions.csv")
+        dst = os.path.join(folder, "minimap_positions.csv")
+        if os.path.exists(src):
+            os.replace(src, dst)
+            print(f"Minimap positions saved to {dst}")
+        # Clean up temp folder
+        try:
+            os.rmdir("_minimap_temp")
+        except OSError:
+            pass
 
     print("Match data saved in:", folder)
 
