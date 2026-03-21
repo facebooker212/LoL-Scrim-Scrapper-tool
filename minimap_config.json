@@ -1,0 +1,36 @@
+{
+  "minimap_region": [
+    1365,
+    528,
+    1878,
+    1044
+  ],
+  "icon_size": 43,
+  "window_relative": true,
+  "color_ranges": {
+    "ORDER": {
+      "lower": [
+        88,
+        195,
+        164
+      ],
+      "upper": [
+        112,
+        255,
+        255
+      ]
+    },
+    "CHAOS": {
+      "lower": [
+        0,
+        128,
+        172
+      ],
+      "upper": [
+        12,
+        255,
+        255
+      ]
+    }
+  }
+}

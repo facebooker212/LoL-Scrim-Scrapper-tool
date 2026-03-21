@@ -9,7 +9,9 @@ from analysis import (
     detect_teamfights, reconstruct_fights, compute_fight_breakdown,
     kill_participation, enrich_turrets, enrich_inhibs,
     compute_all_correlations,
-    TEAM_COLORS,
+    load_minimap_positions, preprocess_minimap,
+    zone_presence, movement_timeline,
+    TEAM_COLORS, MAP_WIDTH, MAP_HEIGHT,
 )
 import analysis
 
@@ -75,6 +77,10 @@ except Exception as e:
 analysis.TEAMFIGHT_WINDOW    = tf_window
 analysis.TEAMFIGHT_MIN_KILLS = tf_min_kills
 
+# Load minimap positions if available
+minimap_raw = load_minimap_positions(folder)
+minimap_df  = preprocess_minimap(minimap_raw, metadata) if minimap_raw is not None else None
+
 fights_raw    = detect_teamfights(kills)
 fights        = reconstruct_fights(fights_raw, players)
 fight_details = compute_fight_breakdown(fights_raw, players)
@@ -100,7 +106,7 @@ with c5:
 
 st.markdown("---")
 
-tab_fights, tab_objectives, tab_correlations = st.tabs(["⚔️ Teamfights", "🏰 Objectives", "📊 Win Correlations"])
+tab_fights, tab_objectives, tab_correlations, tab_minimap = st.tabs(["⚔️ Teamfights", "🏰 Objectives", "📊 Win Correlations", "🗺️ Player Movement"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — TEAMFIGHTS
@@ -504,3 +510,221 @@ with tab_correlations:
         "📌 These metrics reflect a single match. "
         "Win correlation percentages become meaningful once you have 10+ matches recorded."
     )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — PLAYER MOVEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_minimap:
+
+    if minimap_df is None or minimap_df.empty:
+        st.info(
+            "No minimap position data found for this match. "
+            "Make sure minimap_tracker.py ran alongside main.py and that "
+            "minimap_positions.csv is present in the match folder."
+        )
+        st.stop()
+
+    st.markdown(
+        f"**{len(minimap_df):,} position detections** after filtering  "
+        f"· Game duration: {minimap_df['minute'].max():.1f} min"
+    )
+
+    st.caption(
+        "Champion identities are shown where template matching succeeded. "
+        "Unknown detections are grouped by team color. "
+        "Positions are approximate — pings and wards may cause occasional noise."
+    )
+
+    st.markdown("---")
+
+    # ── Heatmap — all positions on map ───────────────────────────────────────
+    st.markdown("<div class='section-header'>Position Heatmap</div>", unsafe_allow_html=True)
+
+    team_filter = st.radio("Team", ["Both", "ORDER", "CHAOS"],
+                           horizontal=True, key="mm_team")
+
+    plot_df = minimap_df.copy()
+    if team_filter != "Both":
+        plot_df = plot_df[plot_df["team"] == team_filter]
+
+    # Summoner's Rift map image coordinate space:
+    # map_x: 0 (left) → MAP_WIDTH (right)
+    # map_y: 0 (bottom) → MAP_HEIGHT (top)  — already flipped in tracker
+    # We flip Y for screen display (0 = top of image)
+    plot_df = plot_df.copy()
+    plot_df["display_y"] = MAP_HEIGHT - plot_df["map_y"]
+
+    fig_heat = go.Figure()
+
+    for team, color in TEAM_COLORS.items():
+        if team_filter != "Both" and team != team_filter:
+            continue
+        t = plot_df[plot_df["team"] == team]
+        if t.empty:
+            continue
+        fig_heat.add_trace(go.Histogram2dContour(
+            x=t["map_x"],
+            y=t["display_y"],
+            name=team,
+            colorscale=[[0, "rgba(0,0,0,0)"],
+                        [1, color]],
+            showscale=False,
+            ncontours=12,
+            contours=dict(showlines=False),
+            opacity=0.6,
+        ))
+
+    # Scatter overlay for individual detections (subsampled to keep it readable)
+    sample = plot_df.sample(min(len(plot_df), 2000), random_state=42)
+    fig_heat.add_trace(go.Scatter(
+        x=sample["map_x"],
+        y=sample["display_y"],
+        mode="markers",
+        marker=dict(
+            size=3,
+            color=sample["team"].map(TEAM_COLORS),
+            opacity=0.25,
+        ),
+        name="Detections",
+        hovertemplate=(
+            "Team: %{customdata[0]}<br>"
+            "Champion: %{customdata[1]}<br>"
+            "Minute: %{customdata[2]:.1f}<br>"
+            "Zone: %{customdata[3]}"
+            "<extra></extra>"
+        ),
+        customdata=sample[["team", "champion", "minute", "zone"]].values,
+    ))
+
+    fig_heat.update_layout(
+        height=520,
+        xaxis=dict(range=[0, MAP_WIDTH], showgrid=False, zeroline=False,
+                   showticklabels=False, title=""),
+        yaxis=dict(range=[0, MAP_HEIGHT], showgrid=False, zeroline=False,
+                   showticklabels=False, title="", scaleanchor="x", scaleratio=1),
+        plot_bgcolor="rgba(20,30,20,1)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=10, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01),
+    )
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Movement timeline ─────────────────────────────────────────────────────
+    st.markdown("<div class='section-header'>Average Position Over Time (2-min buckets)</div>",
+                unsafe_allow_html=True)
+
+    mv = movement_timeline(minimap_df)
+    if not mv.empty:
+        col_x, col_y = st.columns(2)
+
+        with col_x:
+            fig_x = px.line(
+                mv, x="minute_bucket", y="avg_x",
+                color="team",
+                color_discrete_map=TEAM_COLORS,
+                labels={"minute_bucket": "Minute", "avg_x": "Avg Map X (← Blue side · Red side →)"},
+                title="Average X Position",
+                markers=True,
+            )
+            fig_x.update_layout(
+                height=300,
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_x, use_container_width=True)
+
+        with col_y:
+            fig_y = px.line(
+                mv, x="minute_bucket", y="avg_y",
+                color="team",
+                color_discrete_map=TEAM_COLORS,
+                labels={"minute_bucket": "Minute", "avg_y": "Avg Map Y (↓ Bot lane · Top lane ↑)"},
+                title="Average Y Position",
+                markers=True,
+            )
+            fig_y.update_layout(
+                height=300,
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_y, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Zone presence ─────────────────────────────────────────────────────────
+    st.markdown("<div class='section-header'>Map Zone Presence</div>", unsafe_allow_html=True)
+
+    zp = zone_presence(minimap_df)
+    if not zp.empty:
+        col_zo, col_zc = st.columns(2)
+
+        for col, team in [(col_zo, "ORDER"), (col_zc, "CHAOS")]:
+            with col:
+                tag_cls = "tag-order" if team == "ORDER" else "tag-chaos"
+                st.markdown(
+                    f"<span class='tag {tag_cls}'>{team}</span>",
+                    unsafe_allow_html=True,
+                )
+                t_zones = zp[zp["team"] == team].sort_values("pct", ascending=True)
+                if not t_zones.empty:
+                    fig_z = px.bar(
+                        t_zones,
+                        x="pct", y="zone",
+                        orientation="h",
+                        labels={"pct": "% of Detections", "zone": ""},
+                        color_discrete_sequence=[TEAM_COLORS[team]],
+                    )
+                    fig_z.update_layout(
+                        height=300,
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        showlegend=False,
+                        margin=dict(l=0, r=10, t=10, b=0),
+                    )
+                    st.plotly_chart(fig_z, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Identified champions scatter ──────────────────────────────────────────
+    known = minimap_df[minimap_df["champion"] != "unknown"]
+    if not known.empty:
+        st.markdown("<div class='section-header'>Identified Champion Tracks</div>",
+                    unsafe_allow_html=True)
+        st.caption(f"{len(known)} detections with a matched champion identity.")
+
+        known = known.copy()
+        known["display_y"] = MAP_HEIGHT - known["map_y"]
+
+        fig_known = px.scatter(
+            known,
+            x="map_x", y="display_y",
+            color="champion",
+            symbol="team",
+            hover_data={"minute": ":.1f", "zone": True, "confidence": ":.2f"},
+            labels={"map_x": "", "display_y": ""},
+            title="Detected Champion Positions",
+            opacity=0.7,
+        )
+        fig_known.update_layout(
+            height=420,
+            xaxis=dict(range=[0, MAP_WIDTH], showgrid=False,
+                       zeroline=False, showticklabels=False),
+            yaxis=dict(range=[0, MAP_HEIGHT], showgrid=False,
+                       zeroline=False, showticklabels=False,
+                       scaleanchor="x", scaleratio=1),
+            plot_bgcolor="rgba(20,30,20,1)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=0, r=0, t=30, b=0),
+        )
+        st.plotly_chart(fig_known, use_container_width=True)
+    else:
+        st.info(
+            "No champions were identified by template matching in this match. "
+            "Positions are still shown by team color in the heatmap above. "
+            "Champion identification improves when the minimap scale is consistent "
+            "and champion_icons/ contains portrait crops at the correct size."
+        )

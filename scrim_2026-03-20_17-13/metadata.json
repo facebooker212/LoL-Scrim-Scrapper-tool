@@ -1,0 +1,141 @@
+{
+  "match": {
+    "map": "Map11",
+    "mode": "CLASSIC",
+    "map_terrain": "Default",
+    "start_time": "2026-03-20T22:44:08.801823+00:00",
+    "winner": "ORDER"
+  },
+  "players": [
+    {
+      "summonerName": "SDM TankDeivis#NENE",
+      "riotId": "SDM TankDeivis#NENE",
+      "team": "ORDER",
+      "champion": "K'Sante",
+      "is_bot": false,
+      "position": "TOP",
+      "keystone": "Aftershock",
+      "primary_rune_tree": "Resolve",
+      "secondary_rune_tree": "Inspiration",
+      "summoner_spell_1": "Flash",
+      "summoner_spell_2": "Teleport"
+    },
+    {
+      "summonerName": "Sua#5620",
+      "riotId": "Sua#5620",
+      "team": "ORDER",
+      "champion": "Xin Zhao",
+      "is_bot": false,
+      "position": "JUNGLE",
+      "keystone": "Conqueror",
+      "primary_rune_tree": "Precision",
+      "secondary_rune_tree": "Inspiration",
+      "summoner_spell_1": "Flash",
+      "summoner_spell_2": "Smite"
+    },
+    {
+      "summonerName": "Lucky#Irly",
+      "riotId": "Lucky#Irly",
+      "team": "ORDER",
+      "champion": "Hwei",
+      "is_bot": false,
+      "position": "MIDDLE",
+      "keystone": "Arcane Comet",
+      "primary_rune_tree": "Sorcery",
+      "secondary_rune_tree": "Precision",
+      "summoner_spell_1": "Flash",
+      "summoner_spell_2": "Teleport"
+    },
+    {
+      "summonerName": "\ud788\ub4e0\u02c9#\u02c9\u02c9\u02c9",
+      "riotId": "\ud788\ub4e0\u02c9#\u02c9\u02c9\u02c9",
+      "team": "ORDER",
+      "champion": "Kai'Sa",
+      "is_bot": false,
+      "position": "BOTTOM",
+      "keystone": "Lethal Tempo",
+      "primary_rune_tree": "Precision",
+      "secondary_rune_tree": "Inspiration",
+      "summoner_spell_1": "Cleanse",
+      "summoner_spell_2": "Flash"
+    },
+    {
+      "summonerName": "jalancer187#LAN",
+      "riotId": "jalancer187#LAN",
+      "team": "ORDER",
+      "champion": "Galio",
+      "is_bot": false,
+      "position": "UTILITY",
+      "keystone": "Aftershock",
+      "primary_rune_tree": "Resolve",
+      "secondary_rune_tree": "Inspiration",
+      "summoner_spell_1": "Ignite",
+      "summoner_spell_2": "Flash"
+    },
+    {
+      "summonerName": "NOC Mourd#LANN",
+      "riotId": "NOC Mourd#LANN",
+      "team": "CHAOS",
+      "champion": "Olaf",
+      "is_bot": false,
+      "position": "TOP",
+      "keystone": "Conqueror",
+      "primary_rune_tree": "Precision",
+      "secondary_rune_tree": "Inspiration",
+      "summoner_spell_1": "Ghost",
+      "summoner_spell_2": "Flash"
+    },
+    {
+      "summonerName": "RaiSuke#Pau",
+      "riotId": "RaiSuke#Pau",
+      "team": "CHAOS",
+      "champion": "Wukong",
+      "is_bot": false,
+      "position": "JUNGLE",
+      "keystone": "Conqueror",
+      "primary_rune_tree": "Precision",
+      "secondary_rune_tree": "Domination",
+      "summoner_spell_1": "Flash",
+      "summoner_spell_2": "Smite"
+    },
+    {
+      "summonerName": "Applenick3#LAN",
+      "riotId": "Applenick3#LAN",
+      "team": "CHAOS",
+      "champion": "Lissandra",
+      "is_bot": false,
+      "position": "MIDDLE",
+      "keystone": "Electrocute",
+      "primary_rune_tree": "Domination",
+      "secondary_rune_tree": "Sorcery",
+      "summoner_spell_1": "Teleport",
+      "summoner_spell_2": "Flash"
+    },
+    {
+      "summonerName": "PoritoBelCoffe#LAN",
+      "riotId": "PoritoBelCoffe#LAN",
+      "team": "CHAOS",
+      "champion": "Corki",
+      "is_bot": false,
+      "position": "BOTTOM",
+      "keystone": "Conqueror",
+      "primary_rune_tree": "Precision",
+      "secondary_rune_tree": "Inspiration",
+      "summoner_spell_1": "Flash",
+      "summoner_spell_2": "Barrier"
+    },
+    {
+      "summonerName": "NOC Meperdonass#8377",
+      "riotId": "NOC Meperdonass#8377",
+      "team": "CHAOS",
+      "champion": "Maokai",
+      "is_bot": false,
+      "position": "UTILITY",
+      "keystone": "Aftershock",
+      "primary_rune_tree": "Resolve",
+      "secondary_rune_tree": "Precision",
+      "summoner_spell_1": "Ignite",
+      "summoner_spell_2": "Flash"
+    }
+  ]
+}

@@ -616,3 +616,167 @@ def compute_all_correlations(metadata, players, kills_raw, turrets, timeline, fi
         "level_lead_10":        metric_early_level_lead(timeline, players, winner, minute=10),
         "final_kill_diff":      metric_final_kill_differential(kills, winner),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MINIMAP POSITION ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Summoner's Rift map dimensions — match minimap_tracker.py
+MAP_WIDTH  = 14870
+MAP_HEIGHT = 14870
+
+# Named zones on Summoner's Rift for contextual labelling
+# Each zone is (name, min_x, max_x, min_y, max_y)
+MAP_ZONES = [
+    ("Blue Base",     0,     2000,  0,     2000),
+    ("Red Base",      12870, 14870, 12870, 14870),
+    ("Dragon Pit",    8500,  10500, 3000,  5500),
+    ("Baron Pit",     3500,  5500,  9500,  12000),
+    ("Mid Lane",      5000,  10000, 5000,  10000),
+    ("Top Lane",      0,     4000,  10000, 14870),
+    ("Bot Lane",      10000, 14870, 0,     4000),
+    ("Blue Jungle",   0,     7000,  0,     7000),
+    ("Red Jungle",    7000,  14870, 7000,  14870),
+]
+
+
+def load_minimap_positions(folder):
+    """
+    Load minimap_positions.csv from a match folder.
+    Returns a DataFrame or None if the file doesn't exist.
+    """
+    path = os.path.join(folder, "minimap_positions.csv")
+    if not os.path.exists(path):
+        return None
+    df = pd.read_csv(path)
+    return df
+
+
+def preprocess_minimap(positions, metadata):
+    """
+    Clean and enrich minimap position data.
+
+    - Convert wall-clock timestamps to game-relative seconds and minutes
+    - Apply temporal deduplication: drop detections with no nearby match
+      in the previous frame (filters out pings and transient false positives)
+    - Cap detections per frame to 10 (one per champion)
+    - Label map zones
+    """
+    if positions is None or positions.empty:
+        return None
+
+    df = positions.copy()
+
+    # Convert wall-clock Unix timestamps to game-relative seconds
+    # The first timestamp = game start (t=0)
+    t0 = df["timestamp"].min()
+    df["game_seconds"] = df["timestamp"] - t0
+    df["minute"] = df["game_seconds"] / 60
+
+    # ── Temporal consistency filter ───────────────────────────────────────────
+    # Group by frame (same timestamp). For each detection, check if a detection
+    # exists within 30 map units in the PREVIOUS frame. If not, it's likely a
+    # ping or transient artefact — drop it.
+    df = _temporal_filter(df, proximity=30)
+
+    # ── Cap detections per frame to 10 ───────────────────────────────────────
+    # If more than 10 are detected in a single frame, keep the 10 with the
+    # highest confidence, or if all are 0.0 keep the first 5 per team.
+    df = _cap_detections_per_frame(df)
+
+    # ── Zone labelling ────────────────────────────────────────────────────────
+    df["zone"] = df.apply(
+        lambda r: _get_zone(r["map_x"], r["map_y"]), axis=1
+    )
+
+    return df
+
+
+def _temporal_filter(df, proximity=30):
+    """
+    Drop detections that don't have a nearby detection in the previous frame.
+    Champions persist across frames; pings appear once and vanish.
+    """
+    frames = sorted(df["timestamp"].unique())
+    if len(frames) < 2:
+        return df  # not enough frames to filter
+
+    keep_indices = []
+    prev_frame = None
+
+    for ts in frames:
+        curr = df[df["timestamp"] == ts]
+
+        if prev_frame is None:
+            # Always keep the first frame
+            keep_indices.extend(curr.index.tolist())
+            prev_frame = curr
+            continue
+
+        for idx, row in curr.iterrows():
+            # Check if any detection in the previous frame is within proximity
+            dists = ((prev_frame["map_x"] - row["map_x"]) ** 2 +
+                     (prev_frame["map_y"] - row["map_y"]) ** 2) ** 0.5
+            if (dists < proximity).any():
+                keep_indices.append(idx)
+
+        prev_frame = curr
+
+    return df.loc[keep_indices].reset_index(drop=True)
+
+
+def _cap_detections_per_frame(df, max_per_frame=10):
+    """Keep at most max_per_frame detections per timestamp."""
+    def cap_group(g):
+        if len(g) <= max_per_frame:
+            return g
+        # Prefer higher confidence; if tied keep first 5 per team
+        high_conf = g[g["confidence"] > 0]
+        if len(high_conf) >= 1:
+            return g.nlargest(max_per_frame, "confidence")
+        order = g[g["team"] == "ORDER"].head(max_per_frame // 2)
+        chaos = g[g["team"] == "CHAOS"].head(max_per_frame // 2)
+        return pd.concat([order, chaos])
+
+    return df.groupby("timestamp", group_keys=False).apply(cap_group).reset_index(drop=True)
+
+
+def _get_zone(map_x, map_y):
+    for name, x0, x1, y0, y1 in MAP_ZONES:
+        if x0 <= map_x <= x1 and y0 <= map_y <= y1:
+            return name
+    return "Map"
+
+
+def zone_presence(positions_df):
+    """
+    How much time (% of detections) did each team spend in each map zone?
+    Returns a DataFrame with columns: team, zone, count, pct.
+    """
+    if positions_df is None or positions_df.empty:
+        return pd.DataFrame()
+
+    total = positions_df.groupby("team").size().rename("total")
+    counts = positions_df.groupby(["team", "zone"]).size().rename("count").reset_index()
+    counts = counts.merge(total.reset_index(), on="team")
+    counts["pct"] = (counts["count"] / counts["total"] * 100).round(1)
+    return counts.sort_values(["team", "count"], ascending=[True, False])
+
+
+def movement_timeline(positions_df):
+    """
+    Average map_x and map_y per team per minute bucket.
+    Useful for showing where each team was spending time across the game.
+    """
+    if positions_df is None or positions_df.empty:
+        return pd.DataFrame()
+
+    df = positions_df.copy()
+    df["minute_bucket"] = df["minute"].apply(lambda m: int(m // 2) * 2)  # 2-min buckets
+    agg = df.groupby(["minute_bucket", "team"]).agg(
+        avg_x=("map_x", "mean"),
+        avg_y=("map_y", "mean"),
+        detections=("map_x", "count"),
+    ).reset_index()
+    return agg
