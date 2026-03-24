@@ -1,12 +1,12 @@
 {
   "minimap_region": [
-    1365,
-    528,
-    1878,
-    1044
+    1822,
+    706,
+    2502,
+    1386
   ],
-  "icon_size": 43,
-  "window_relative": true,
+  "icon_size": 57,
+  "window_relative": false,
   "color_ranges": {
     "ORDER": {
       "lower": [

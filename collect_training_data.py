@@ -67,10 +67,10 @@ from minimap_tracker import (
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
-CAPTURE_INTERVAL       = 2.0
+CAPTURE_INTERVAL       = 0.5
 COMPARE_SIZE           = 32
 DEDUP_RADIUS           = 500
-DEDUP_SECONDS          = 10.0
+DEDUP_SECONDS          = 5.0
 AUTO_LABEL_THRESHOLD   = 0.38
 
 LCS_API_URL  = "https://127.0.0.1:2999/liveclientdata/allgamedata"
@@ -203,7 +203,7 @@ class TrainingDataCollector:
                 continue
 
             # Print every 10th frame so we can see it is running
-            if frames_captured % 10 == 1:
+            if frames_captured % 40 == 1:
                 print(f"[collector] frame={frames_captured}  candidates={len(merged)}  saved={self._saved}")
 
             # ── Save crops ────────────────────────────────────────────────────

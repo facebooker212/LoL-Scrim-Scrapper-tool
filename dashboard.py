@@ -11,6 +11,7 @@ from analysis import (
     compute_all_correlations,
     load_minimap_positions, preprocess_minimap,
     zone_presence, movement_timeline,
+    detect_solo_kills, solo_kill_summary,
     TEAM_COLORS, MAP_WIDTH, MAP_HEIGHT,
 )
 import analysis
@@ -82,6 +83,9 @@ minimap_raw = load_minimap_positions(folder)
 minimap_df  = preprocess_minimap(minimap_raw, metadata) if minimap_raw is not None else None
 
 fights_raw    = detect_teamfights(kills)
+# solo_kills computed later with slider value — initialise with default
+solo_kills    = detect_solo_kills(kills, players, max_enemy_side=2)
+solo_summary  = solo_kill_summary(solo_kills, players)
 fights        = reconstruct_fights(fights_raw, players)
 fight_details = compute_fight_breakdown(fights_raw, players)
 kp            = kill_participation(kills, players)
@@ -106,7 +110,7 @@ with c5:
 
 st.markdown("---")
 
-tab_fights, tab_objectives, tab_correlations, tab_minimap = st.tabs(["⚔️ Teamfights", "🏰 Objectives", "📊 Win Correlations", "🗺️ Player Movement"])
+tab_fights, tab_objectives, tab_correlations, tab_minimap, tab_solo = st.tabs(["⚔️ Teamfights", "🏰 Objectives", "📊 Win Correlations", "🗺️ Player Movement", "⚠️ Solo Fights"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — TEAMFIGHTS
@@ -524,207 +528,382 @@ with tab_minimap:
         )
         st.stop()
 
-    st.markdown(
-        f"**{len(minimap_df):,} position detections** after filtering  "
-        f"· Game duration: {minimap_df['minute'].max():.1f} min"
-    )
+    # ── Build champion list ───────────────────────────────────────────────────
+    # Only champions with identified detections get path lines
+    mm = minimap_df.copy()
+    mm["display_y"] = MAP_HEIGHT - mm["map_y"]
 
-    st.caption(
-        "Champion identities are shown where template matching succeeded. "
-        "Unknown detections are grouped by team color. "
-        "Positions are approximate — pings and wards may cause occasional noise."
+    known_df = mm[mm["champion"] != "unknown"].copy()
+    all_champs = sorted(known_df["champion"].unique()) if not known_df.empty else []
+
+    # Build a stable color per champion — ORDER blue hues, CHAOS red hues
+    import colorsys
+    order_champs_all = sorted([
+        c for c in all_champs
+        if not known_df[known_df["champion"] == c].empty and
+        known_df[known_df["champion"] == c]["team"].iloc[0] == "ORDER"
+    ])
+    chaos_champs_all = sorted([
+        c for c in all_champs
+        if not known_df[known_df["champion"] == c].empty and
+        known_df[known_df["champion"] == c]["team"].iloc[0] == "CHAOS"
+    ])
+
+    def make_champ_colors(champ_list, team):
+        colors = {}
+        n = max(len(champ_list), 1)
+        for i, c in enumerate(champ_list):
+            if team == "ORDER":
+                h = 0.52 + 0.14 * (i / n)
+            else:
+                h = 0.98 + 0.10 * (i / n)
+                h = h % 1.0
+            r, g, b = colorsys.hsv_to_rgb(h, 0.85, 0.95)
+            colors[c] = f"rgb({int(r*255)},{int(g*255)},{int(b*255)})"
+        return colors
+
+    champ_colors = {}
+    champ_colors.update(make_champ_colors(order_champs_all, "ORDER"))
+    champ_colors.update(make_champ_colors(chaos_champs_all, "CHAOS"))
+
+    st.markdown(
+        f"**{len(mm):,} total detections**  ·  "
+        f"**{len(known_df):,} identified**  ·  "
+        f"**{len(all_champs)} champions**  ·  "
+        f"Game: {mm['minute'].max():.1f} min"
     )
 
     st.markdown("---")
 
-    # ── Heatmap — all positions on map ───────────────────────────────────────
-    st.markdown("<div class='section-header'>Position Heatmap</div>", unsafe_allow_html=True)
+    # ── Champion selector ─────────────────────────────────────────────────────
+    st.markdown("<div class='section-header'>Champion Path Map</div>",
+                unsafe_allow_html=True)
+    st.caption(
+        "Select one or more champions to draw their movement path. "
+        "Start with none selected to see an empty map, then add players one by one."
+    )
 
-    team_filter = st.radio("Team", ["Both", "ORDER", "CHAOS"],
-                           horizontal=True, key="mm_team")
+    # Two-column selector: ORDER left, CHAOS right
+    col_sel_o, col_sel_c = st.columns(2)
+    with col_sel_o:
+        st.markdown("<span class='tag tag-order'>ORDER</span>", unsafe_allow_html=True)
+        sel_order = st.multiselect(
+            "ORDER champions",
+            options=order_champs_all,
+            default=[],
+            key="path_order",
+            label_visibility="collapsed",
+        )
+    with col_sel_c:
+        st.markdown("<span class='tag tag-chaos'>CHAOS</span>", unsafe_allow_html=True)
+        sel_chaos = st.multiselect(
+            "CHAOS champions",
+            options=chaos_champs_all,
+            default=[],
+            key="path_chaos",
+            label_visibility="collapsed",
+        )
 
-    plot_df = minimap_df.copy()
-    if team_filter != "Both":
-        plot_df = plot_df[plot_df["team"] == team_filter]
+    selected = sel_order + sel_chaos
 
-    # Summoner's Rift map image coordinate space:
-    # map_x: 0 (left) → MAP_WIDTH (right)
-    # map_y: 0 (bottom) → MAP_HEIGHT (top)  — already flipped in tracker
-    # We flip Y for screen display (0 = top of image)
-    plot_df = plot_df.copy()
-    plot_df["display_y"] = MAP_HEIGHT - plot_df["map_y"]
+    # ── Path map ──────────────────────────────────────────────────────────────
+    fig_map = go.Figure()
 
-    fig_heat = go.Figure()
+    if not selected:
+        # Empty map with just axis setup — prompt user to select
+        fig_map.add_annotation(
+            text="Select champions above to draw their paths",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5,
+            showarrow=False,
+            font=dict(size=16, color="#888"),
+        )
+    else:
+        for champ in selected:
+            c_df = known_df[known_df["champion"] == champ].sort_values("minute")
+            if c_df.empty:
+                continue
+            color = champ_colors.get(champ, "#aaa")
 
-    for team, color in TEAM_COLORS.items():
-        if team_filter != "Both" and team != team_filter:
-            continue
-        t = plot_df[plot_df["team"] == team]
-        if t.empty:
-            continue
-        fig_heat.add_trace(go.Histogram2dContour(
-            x=t["map_x"],
-            y=t["display_y"],
-            name=team,
-            colorscale=[[0, "rgba(0,0,0,0)"],
-                        [1, color]],
-            showscale=False,
-            ncontours=12,
-            contours=dict(showlines=False),
-            opacity=0.6,
-        ))
+            # Full path line
+            fig_map.add_trace(go.Scatter(
+                x=c_df["map_x"],
+                y=c_df["display_y"],
+                mode="lines",
+                name=champ,
+                line=dict(color=color, width=2),
+                opacity=0.75,
+                hoverinfo="skip",
+                showlegend=True,
+            ))
 
-    # Scatter overlay for individual detections (subsampled to keep it readable)
-    sample = plot_df.sample(min(len(plot_df), 2000), random_state=42)
-    fig_heat.add_trace(go.Scatter(
-        x=sample["map_x"],
-        y=sample["display_y"],
-        mode="markers",
-        marker=dict(
-            size=3,
-            color=sample["team"].map(TEAM_COLORS),
-            opacity=0.25,
-        ),
-        name="Detections",
-        hovertemplate=(
-            "Team: %{customdata[0]}<br>"
-            "Champion: %{customdata[1]}<br>"
-            "Minute: %{customdata[2]:.1f}<br>"
-            "Zone: %{customdata[3]}"
-            "<extra></extra>"
-        ),
-        customdata=sample[["team", "champion", "minute", "zone"]].values,
-    ))
+            # Detection dots on top of the line
+            fig_map.add_trace(go.Scatter(
+                x=c_df["map_x"],
+                y=c_df["display_y"],
+                mode="markers",
+                name=champ,
+                marker=dict(size=5, color=color),
+                hovertemplate=(
+                    f"<b>{champ}</b><br>"
+                    "Time: %{customdata:.1f} min<br>"
+                    "Zone: %{text}<br>"
+                    "<extra></extra>"
+                ),
+                customdata=c_df["minute"].values,
+                text=c_df["zone"].values,
+                showlegend=False,
+            ))
 
-    fig_heat.update_layout(
-        height=520,
+            # Start marker (open circle) and end marker (star)
+            fig_map.add_trace(go.Scatter(
+                x=[c_df.iloc[0]["map_x"], c_df.iloc[-1]["map_x"]],
+                y=[c_df.iloc[0]["display_y"], c_df.iloc[-1]["display_y"]],
+                mode="markers",
+                marker=dict(
+                    size=[12, 14],
+                    color=color,
+                    symbol=["circle-open", "star"],
+                    line=dict(width=2, color=color),
+                ),
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+
+    fig_map.update_layout(
+        height=600,
         xaxis=dict(range=[0, MAP_WIDTH], showgrid=False, zeroline=False,
                    showticklabels=False, title=""),
         yaxis=dict(range=[0, MAP_HEIGHT], showgrid=False, zeroline=False,
-                   showticklabels=False, title="", scaleanchor="x", scaleratio=1),
-        plot_bgcolor="rgba(20,30,20,1)",
+                   showticklabels=False, title="",
+                   scaleanchor="x", scaleratio=1),
+        plot_bgcolor="rgba(15,25,15,1)",
         paper_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=0, r=0, t=10, b=0),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01),
+        legend=dict(
+            orientation="v",
+            x=1.01, y=1,
+            bgcolor="rgba(0,0,0,0.4)",
+            font=dict(size=11),
+        ),
+        hovermode="closest",
     )
-    st.plotly_chart(fig_heat, use_container_width=True)
+    st.plotly_chart(fig_map, use_container_width=True)
+    st.caption("○ = path start  ★ = path end  · Lines connect detections chronologically")
 
     st.markdown("---")
 
-    # ── Movement timeline ─────────────────────────────────────────────────────
-    st.markdown("<div class='section-header'>Average Position Over Time (2-min buckets)</div>",
-                unsafe_allow_html=True)
-
-    mv = movement_timeline(minimap_df)
-    if not mv.empty:
-        col_x, col_y = st.columns(2)
-
-        with col_x:
-            fig_x = px.line(
-                mv, x="minute_bucket", y="avg_x",
-                color="team",
-                color_discrete_map=TEAM_COLORS,
-                labels={"minute_bucket": "Minute", "avg_x": "Avg Map X (← Blue side · Red side →)"},
-                title="Average X Position",
-                markers=True,
-            )
-            fig_x.update_layout(
-                height=300,
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_x, use_container_width=True)
-
-        with col_y:
-            fig_y = px.line(
-                mv, x="minute_bucket", y="avg_y",
-                color="team",
-                color_discrete_map=TEAM_COLORS,
-                labels={"minute_bucket": "Minute", "avg_y": "Avg Map Y (↓ Bot lane · Top lane ↑)"},
-                title="Average Y Position",
-                markers=True,
-            )
-            fig_y.update_layout(
-                height=300,
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_y, use_container_width=True)
-
-    st.markdown("---")
-
-    # ── Zone presence ─────────────────────────────────────────────────────────
-    st.markdown("<div class='section-header'>Map Zone Presence</div>", unsafe_allow_html=True)
-
-    zp = zone_presence(minimap_df)
-    if not zp.empty:
-        col_zo, col_zc = st.columns(2)
-
-        for col, team in [(col_zo, "ORDER"), (col_zc, "CHAOS")]:
-            with col:
-                tag_cls = "tag-order" if team == "ORDER" else "tag-chaos"
-                st.markdown(
-                    f"<span class='tag {tag_cls}'>{team}</span>",
-                    unsafe_allow_html=True,
-                )
-                t_zones = zp[zp["team"] == team].sort_values("pct", ascending=True)
-                if not t_zones.empty:
-                    fig_z = px.bar(
-                        t_zones,
-                        x="pct", y="zone",
-                        orientation="h",
-                        labels={"pct": "% of Detections", "zone": ""},
-                        color_discrete_sequence=[TEAM_COLORS[team]],
-                    )
-                    fig_z.update_layout(
-                        height=300,
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        showlegend=False,
-                        margin=dict(l=0, r=10, t=10, b=0),
-                    )
-                    st.plotly_chart(fig_z, use_container_width=True)
-
-    st.markdown("---")
-
-    # ── Identified champions scatter ──────────────────────────────────────────
-    known = minimap_df[minimap_df["champion"] != "unknown"]
-    if not known.empty:
-        st.markdown("<div class='section-header'>Identified Champion Tracks</div>",
+    # ── Individual heatmaps ───────────────────────────────────────────────────
+    if selected:
+        st.markdown("<div class='section-header'>Individual Position Heatmaps</div>",
                     unsafe_allow_html=True)
-        st.caption(f"{len(known)} detections with a matched champion identity.")
+        st.caption("Where each selected champion spent most of their time across the game.")
 
-        known = known.copy()
-        known["display_y"] = MAP_HEIGHT - known["map_y"]
+        # Render in rows of 2
+        for i in range(0, len(selected), 2):
+            cols = st.columns(2)
+            for j, champ in enumerate(selected[i:i+2]):
+                c_df = known_df[known_df["champion"] == champ]
+                if c_df.empty:
+                    continue
+                color = champ_colors.get(champ, "#aaa")
+                team  = c_df["team"].iloc[0]
 
-        fig_known = px.scatter(
-            known,
-            x="map_x", y="display_y",
-            color="champion",
-            symbol="team",
-            hover_data={"minute": ":.1f", "zone": True, "confidence": ":.2f"},
-            labels={"map_x": "", "display_y": ""},
-            title="Detected Champion Positions",
-            opacity=0.7,
-        )
-        fig_known.update_layout(
-            height=420,
-            xaxis=dict(range=[0, MAP_WIDTH], showgrid=False,
-                       zeroline=False, showticklabels=False),
-            yaxis=dict(range=[0, MAP_HEIGHT], showgrid=False,
-                       zeroline=False, showticklabels=False,
-                       scaleanchor="x", scaleratio=1),
-            plot_bgcolor="rgba(20,30,20,1)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            margin=dict(l=0, r=0, t=30, b=0),
-        )
-        st.plotly_chart(fig_known, use_container_width=True)
+                with cols[j]:
+                    tag_cls = "tag-order" if team == "ORDER" else "tag-chaos"
+                    st.markdown(
+                        f"<span class='tag {tag_cls}'>{champ}</span>  "
+                        f"<span style='color:#888;font-size:0.8rem'>"
+                        f"{len(c_df)} detections</span>",
+                        unsafe_allow_html=True,
+                    )
+
+                    fig_h = go.Figure()
+                    fig_h.add_trace(go.Histogram2dContour(
+                        x=c_df["map_x"],
+                        y=c_df["display_y"],
+                        colorscale=[
+                            [0, "rgba(0,0,0,0)"],
+                            [0.3, color.replace("rgb", "rgba").replace(")", ",0.3)")],
+                            [1, color],
+                        ],
+                        showscale=False,
+                        ncontours=10,
+                        contours=dict(showlines=False),
+                    ))
+                    # Scatter dots
+                    fig_h.add_trace(go.Scatter(
+                        x=c_df["map_x"],
+                        y=c_df["display_y"],
+                        mode="markers",
+                        marker=dict(size=3, color=color, opacity=0.3),
+                        showlegend=False,
+                        hoverinfo="skip",
+                    ))
+                    fig_h.update_layout(
+                        height=300,
+                        xaxis=dict(range=[0, MAP_WIDTH], showgrid=False,
+                                   zeroline=False, showticklabels=False, title=""),
+                        yaxis=dict(range=[0, MAP_HEIGHT], showgrid=False,
+                                   zeroline=False, showticklabels=False,
+                                   title="", scaleanchor="x", scaleratio=1),
+                        plot_bgcolor="rgba(15,25,15,1)",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        margin=dict(l=0, r=0, t=5, b=0),
+                    )
+                    st.plotly_chart(fig_h, use_container_width=True)
     else:
-        st.info(
-            "No champions were identified by template matching in this match. "
-            "Positions are still shown by team color in the heatmap above. "
-            "Champion identification improves when the minimap scale is consistent "
-            "and champion_icons/ contains portrait crops at the correct size."
+        st.info("Select champions above to see their individual heatmaps.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — SOLO FIGHTS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_solo:
+
+    st.markdown("""
+    Detects kills where **one side was completely isolated** — exactly one player
+    with no backup — while the other side had up to the configured maximum.
+    A 1v1, 1v2, or 1v3 all count as long as one side was alone.
+    Both outcomes are shown since dying alone and killing while alone both
+    represent coordination issues.
+    """)
+
+    # ── Slider ────────────────────────────────────────────────────────────────
+    col_s1, col_s2 = st.columns([2, 1])
+    with col_s1:
+        max_enemy = st.slider(
+            "Max players on the larger side",
+            min_value=1,
+            max_value=3,
+            value=2,
+            help=(
+                "1 = strict 1v1 only  |  "
+                "2 = 1v1 and 1v2  |  "
+                "3 = 1v1, 1v2, and 1v3. "
+                "One side must always be completely alone."
+            ),
+            key="solo_max_enemy",
+        )
+    with col_s2:
+        st.markdown(
+            f"<br><span style='color:#aaa;font-size:0.9rem'>"
+            f"Showing fights where one side had exactly 1 player "
+            f"and the other had 1–{max_enemy}</span>",
+            unsafe_allow_html=True,
+        )
+
+    # Recompute with current slider value
+    solo_kills   = detect_solo_kills(kills, players, max_enemy_side=max_enemy)
+    solo_summary = solo_kill_summary(solo_kills, players)
+
+    if solo_kills.empty:
+        st.info("No isolated fights detected with current settings.")
+    else:
+        # ── Header metrics ────────────────────────────────────────────────────
+        total       = len(solo_kills)
+        order_iso   = (solo_kills["isolated_team"] == "ORDER").sum()
+        chaos_iso   = (solo_kills["isolated_team"] == "CHAOS").sum()
+        type_counts = solo_kills["fight_type"].value_counts()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Isolated Fights", total)
+        c2.metric("ORDER Players Isolated", int(order_iso))
+        c3.metric("CHAOS Players Isolated", int(chaos_iso))
+
+        # Fight type breakdown
+        type_cols = st.columns(len(type_counts))
+        for i, (ftype, count) in enumerate(type_counts.items()):
+            type_cols[i].metric(ftype, count)
+
+        st.markdown("---")
+
+        # ── Timeline scatter ──────────────────────────────────────────────────
+        st.markdown("<div class='section-header'>Isolated Fight Timeline</div>",
+                    unsafe_allow_html=True)
+        st.caption("Marker color = team of the ISOLATED player (the one who had no backup)")
+
+        fig_solo = go.Figure()
+
+        for team, color in TEAM_COLORS.items():
+            t = solo_kills[solo_kills["isolated_team"] == team]
+            if t.empty:
+                continue
+            fig_solo.add_trace(go.Scatter(
+                x=t["minute"],
+                y=t["fight_type"],
+                mode="markers",
+                marker=dict(size=14, color=color, symbol="x",
+                            line=dict(width=2, color=color)),
+                name=f"{team} isolated",
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b> isolated<br>"
+                    "Killed by: <b>%{customdata[1]}</b><br>"
+                    "Fight: %{customdata[2]}<br>"
+                    "Time: %{x:.1f} min<br>"
+                    "<extra></extra>"
+                ),
+                customdata=t[["isolated_champ", "killer_champ", "fight_type"]].values,
+            ))
+
+        fig_solo.update_layout(
+            height=250,
+            xaxis_title="Game Time (min)",
+            yaxis_title="Fight Type",
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            hovermode="closest",
+        )
+        st.plotly_chart(fig_solo, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── Kill log ──────────────────────────────────────────────────────────
+        st.markdown("<div class='section-header'>Fight Log</div>",
+                    unsafe_allow_html=True)
+
+        log = solo_kills.copy()
+        log["Time"]      = log["minute"].round(2).astype(str) + " min"
+        log["Type"]      = log["fight_type"]
+        log["Isolated"]  = log["isolated_champ"] + " (" + log["isolated_team"] + ")"
+        log["Killer"]    = log["killer_champ"] + " (" + log["killer_team"] + ")"
+        log["Victim"]    = log["victim_champ"] + " (" + log["victim_team"] + ")"
+        log["Assisters"] = log["assisters"]
+        st.dataframe(
+            log[["Time", "Type", "Isolated", "Killer", "Victim", "Assisters"]],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        st.markdown("---")
+
+        # ── Per-player summary ────────────────────────────────────────────────
+        st.markdown("<div class='section-header'>Per-Player Breakdown</div>",
+                    unsafe_allow_html=True)
+        st.caption("Sorted by isolated deaths — players who most often got caught alone")
+
+        if not solo_summary.empty:
+            col_o, col_c = st.columns(2)
+            for col, team in [(col_o, "ORDER"), (col_c, "CHAOS")]:
+                with col:
+                    tag_cls = "tag-order" if team == "ORDER" else "tag-chaos"
+                    st.markdown(
+                        f"<span class='tag {tag_cls}'>{team}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    t_df = solo_summary[solo_summary["team"] == team][
+                        ["player", "champion",
+                         "isolated_deaths", "isolated_kills", "assisted_kills"]
+                    ].rename(columns={
+                        "player":           "Player",
+                        "champion":         "Champion",
+                        "isolated_deaths":  "Died Alone",
+                        "isolated_kills":   "Killed Alone",
+                        "assisted_kills":   "Killed w/ Backup",
+                    })
+                    st.dataframe(t_df, hide_index=True, use_container_width=True)
+
+        st.caption(
+            "**Died Alone** — player was the isolated side and died.  "
+            "**Killed Alone** — player was the isolated side but got the kill.  "
+            "**Killed w/ Backup** — player had teammates assisting the kill."
         )

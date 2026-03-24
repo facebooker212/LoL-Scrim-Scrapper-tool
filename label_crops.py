@@ -159,7 +159,7 @@ def make_display(crop_bgr, suggestion, current_input, total, idx, team):
                 FONT, 0.55, (220, 220, 50), 1)
 
     # Controls
-    cv2.putText(panel, "Enter=confirm  S=skip  D=delete  Q=quit",
+    cv2.putText(panel, "Enter=confirm  2=skip  3=delete  4=quit  Tab=autocomplete",
                 (10, 130), FONT, 0.42, (140, 140, 140), 1)
 
     return np.vstack([enlarged, panel])
@@ -248,21 +248,21 @@ def run_labeler():
                               f"(labeled={labeled_count} skipped={skipped_count})")
                 break
 
-            elif key == ord("s") or key == ord("S"):  # Skip
+            elif key == ord("2"):  # 2 = Skip
                 shutil.move(fpath, os.path.join(SKIPPED_DIR, fname))
                 progress["skipped"].append(fname)
                 skipped_count += 1
                 current_input = ""
                 break
 
-            elif key == ord("d") or key == ord("D"):  # Delete
+            elif key == ord("3"):  # 3 = Delete
                 shutil.move(fpath, os.path.join(DELETED_DIR, fname))
                 progress["deleted"].append(fname)
                 deleted_count += 1
                 current_input = ""
                 break
 
-            elif key == ord("q") or key == ord("Q"):  # Quit
+            elif key == ord("4"):  # 4 = Quit
                 save_progress(progress)
                 cv2.destroyAllWindows()
                 print(f"\nSaved progress. Labeled={labeled_count} "
@@ -306,6 +306,8 @@ def run_labeler():
 
 
 def main():
+    global RAW_CROPS_DIR, TRAINING_DIR
+
     parser = argparse.ArgumentParser(
         description="Label champion icon crops for CNN training"
     )
@@ -319,7 +321,6 @@ def main():
     )
     args = parser.parse_args()
 
-    global RAW_CROPS_DIR, TRAINING_DIR
     RAW_CROPS_DIR = args.crops_dir
     TRAINING_DIR  = args.output_dir
 

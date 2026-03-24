@@ -126,17 +126,15 @@ class WindowCapture:
         Capture the full League window as a BGR numpy array.
         Returns None on failure.
 
-        Uses ctypes to call PrintWindow directly — win32gui.PrintWindow is not
-        exposed in all pywin32 versions so we bypass the binding entirely.
-        PW_RENDERFULLCONTENT (0x2) captures the window even when not focused.
+        Uses BitBlt to read directly from the window device context.
+        BitBlt works for borderless windowed games even when unfocused,
+        unlike PrintWindow which captures the foreground window on some
+        systems when the target window loses focus.
         """
         if not self._use_win32 or not self.hwnd:
             return self._screenshot_mss_fullscreen()
 
         try:
-            import ctypes
-            import ctypes.wintypes
-
             rect = win32gui.GetWindowRect(self.hwnd)
             left, top, right, bottom = rect
             w = right - left
@@ -149,14 +147,9 @@ class WindowCapture:
             bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
             save_dc.SelectObject(bitmap)
 
-            # Call PrintWindow via ctypes to avoid the missing win32gui.PrintWindow binding
-            # PW_RENDERFULLCONTENT = 0x00000002 — works for borderless windowed DX apps
-            _user32 = ctypes.windll.user32
-            result = _user32.PrintWindow(
-                ctypes.wintypes.HWND(self.hwnd),
-                ctypes.wintypes.HDC(save_dc.GetSafeHdc()),
-                ctypes.c_uint(0x00000002)
-            )
+            # BitBlt reads directly from the window DC — works when unfocused
+            # SRCCOPY = 0x00CC0020
+            save_dc.BitBlt((0, 0), (w, h), mfc_dc, (0, 0), win32con.SRCCOPY)
 
             bmp_info = bitmap.GetInfo()
             bmp_str  = bitmap.GetBitmapBits(True)
@@ -169,9 +162,10 @@ class WindowCapture:
             mfc_dc.DeleteDC()
             win32gui.ReleaseDC(self.hwnd, hwnd_dc)
 
-            if result != 1:
-                # PrintWindow returned failure -- likely true fullscreen DX, fall back to mss
-                print("[capture] PrintWindow returned 0 -- is League in Borderless Windowed mode?")
+            # Sanity check — if the capture is mostly black, BitBlt got a blank
+            # frame (can happen briefly during window transitions). Fall back to mss.
+            import numpy as _np
+            if _np.mean(img) < 5:
                 return self._screenshot_mss_window(rect)
 
             return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
@@ -641,6 +635,149 @@ def match_champion(minimap_bgr, x, y, w, h, templates, icon_size, threshold=0.35
     return None, None, 0.0
 
 
+# ── CNN Classifier ────────────────────────────────────────────────────────────
+
+MODEL_PATH = "champion_classifier.pth"
+
+# Torch is optional — falls back to template matching if not installed
+try:
+    import torch
+    import torch.nn as nn
+    from torchvision import transforms as T
+    _torch_available = True
+except ImportError:
+    _torch_available = False
+
+
+class _ChampionCNN(nn.Module if _torch_available else object):
+    """Mirror of the architecture in train_classifier.py."""
+    def __init__(self, num_classes):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True), nn.MaxPool2d(2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(128 * 4 * 4, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        return self.classifier(x)
+
+
+class ChampionClassifier:
+    """
+    Wraps the trained CNN for inference on minimap icon crops.
+    Loaded once at tracker startup. Falls back gracefully if the model
+    file or torch is not available.
+    """
+
+    # Normalisation must match train_classifier.py
+    _transform = T.Compose([
+        T.ToPILImage(),
+        T.Resize((32, 32)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]),
+    ]) if _torch_available else None
+
+    def __init__(self, model_path=MODEL_PATH, team_map=None):
+        """
+        team_map: dict of {champion_name: team} built from current game metadata.
+        Used to restrict predictions to only the 10 champions in the game when
+        provided, improving accuracy significantly.
+        """
+        self.ready      = False
+        self.class_names = []
+        self.team_map   = team_map or {}
+        self._model     = None
+        self._device    = None
+
+        if not _torch_available:
+            print("[classifier] torch not installed — using template matching fallback")
+            return
+
+        if not os.path.exists(model_path):
+            print(f"[classifier] {model_path} not found — using template matching fallback")
+            return
+
+        try:
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            checkpoint   = torch.load(model_path, map_location=self._device,
+                                      weights_only=False)
+            self.class_names = checkpoint["class_names"]
+            num_classes      = checkpoint["num_classes"]
+
+            self._model = _ChampionCNN(num_classes=num_classes).to(self._device)
+            self._model.load_state_dict(checkpoint["model_state"])
+            self._model.eval()
+
+            self.ready = True
+            print(f"[classifier] Loaded CNN — {num_classes} champions, "
+                  f"device={self._device}, val_acc={checkpoint.get('val_acc', 0):.1f}%")
+        except Exception as e:
+            print(f"[classifier] Failed to load model: {e} — using template matching fallback")
+
+    def predict(self, crop_bgr, team_hint=None, threshold=0.5):
+        """
+        Run inference on a border-stripped BGR crop.
+        If team_map is set, restricts candidates to champions on team_hint's team.
+        Returns (champion_name, confidence) or (None, 0.0) if below threshold.
+        """
+        if not self.ready or self._transform is None:
+            return None, 0.0
+
+        try:
+            img_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+            tensor  = self._transform(img_rgb).unsqueeze(0).to(self._device)
+
+            with torch.no_grad():
+                logits = self._model(tensor)
+                probs  = torch.softmax(logits, dim=1)[0]
+
+            # If we know which team this detection belongs to, restrict to that
+            # team's champions — this significantly reduces misclassifications
+            if team_hint and self.team_map:
+                team_champions = {
+                    name for name, team in self.team_map.items()
+                    if team == team_hint
+                }
+                valid_indices = [
+                    i for i, name in enumerate(self.class_names)
+                    if name in team_champions
+                ]
+                if valid_indices:
+                    # Zero out other classes and renormalise
+                    mask = torch.zeros_like(probs)
+                    for i in valid_indices:
+                        mask[i] = probs[i]
+                    if mask.sum() > 0:
+                        probs = mask / mask.sum()
+
+            best_idx  = probs.argmax().item()
+            best_conf = probs[best_idx].item()
+            best_name = self.class_names[best_idx]
+
+            if best_conf >= threshold:
+                return best_name, best_conf
+
+            return None, 0.0
+
+        except Exception as e:
+            print(f"[classifier] Inference error: {e}")
+            return None, 0.0
+
+
 def pixel_to_map_coords(px, py, minimap_w, minimap_h):
     """
     Convert minimap pixel (px, py) to Summoner's Rift logical map coordinates.
@@ -684,6 +821,7 @@ class MinimapTracker:
         self.output_path = os.path.join(folder, "minimap_positions.csv")
         self.champions   = champions or []  # list of {"name":..., "team":...}
         self.templates   = {}
+        self.classifier  = None  # set in _load_templates
         self._thread     = None
         self._stop_event = threading.Event()
         self._csv_lock   = threading.Lock()
@@ -701,10 +839,22 @@ class MinimapTracker:
         self._csv_writer.writeheader()
 
     def _load_templates(self):
+        # Build team map from champions list for team-restricted inference
+        team_map = {p["name"]: p["team"] for p in self.champions if p.get("name")}
+
+        # Try CNN classifier first
+        self.classifier = ChampionClassifier(team_map=team_map)
+
+        if self.classifier.ready:
+            print("[tracker] Using CNN classifier for champion identification.")
+            return
+
+        # Fallback to template matching
         if not self.champions:
             print("[tracker] No champions provided — identity matching disabled.")
             print("[tracker] Will detect positions by team color only.")
             return
+        print("[tracker] Falling back to template matching.")
         self.templates = prepare_champion_templates(
             self.champions, self.icon_size
         )
@@ -737,7 +887,18 @@ class MinimapTracker:
                     cx = x + w // 2
                     cy = y + h // 2
 
-                    if self.templates:
+                    if self.classifier and self.classifier.ready:
+                        # CNN path — strip border and run inference
+                        mm_h_px, mm_w_px = minimap.shape[:2]
+                        x1 = max(0, x); y1 = max(0, y)
+                        x2 = min(mm_w_px, x + w); y2 = min(mm_h_px, y + h)
+                        crop = minimap[y1:y2, x1:x2]
+                        crop_inner = _strip_border(crop) if crop.size > 0 else crop
+                        name, score = self.classifier.predict(
+                            crop_inner, team_hint=team_hint
+                        )
+                        team = team_hint  # team comes from HSV color detection
+                    elif self.templates:
                         name, team, score = match_champion(
                             minimap, x, y, w, h, self.templates, self.icon_size
                         )

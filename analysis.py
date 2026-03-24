@@ -780,3 +780,157 @@ def movement_timeline(positions_df):
         detections=("map_x", "count"),
     ).reset_index()
     return agg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SOLO KILL DETECTION
+# Detects kills where ONE side was isolated — exactly one player from one team
+# with no backup, while the other side had between 1 and max_enemy_side players.
+#
+# The key rule: min(killer_side, victim_side) == 1
+# meaning at least one side was completely alone.
+#
+# Examples at max_enemy_side=2:
+#   1v1 (no assisters)            → detected  isolated_team = victim team
+#   1v2 (killer + 1 assister)     → detected  isolated_team = victim team
+#   2v1 (victim had backup)       → detected  isolated_team = killer team
+#   2v2 or more                   → NOT detected (both sides had backup)
+#
+# These are flagged for coaching regardless of outcome — both dying alone
+# and killing someone alone represent coordination issues.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_solo_kills(kills, players, max_enemy_side=2):
+    """
+    Find kills where one side was completely isolated (exactly 1 player)
+    while the other side had at most max_enemy_side players.
+
+    max_enemy_side: maximum players allowed on the larger side (1-3).
+    A value of 1 means strict 1v1 only.
+    A value of 2 means 1v1 or 1v2 (one side always alone).
+    A value of 3 means 1v1, 1v2, or 1v3.
+
+    Returns a DataFrame with enriched columns including who was isolated.
+    """
+    if kills is None or kills.empty:
+        return pd.DataFrame()
+
+    team_map  = dict(zip(players["normalized"], players["team"]))
+    champ_map = {}
+    for _, p in players.iterrows():
+        name = p.get("normalized", normalize_name(p.get("summonerName", "")))
+        champ_map[name] = p.get("champion", p.get("summonerName", ""))
+
+    rows = []
+    for _, e in kills.iterrows():
+        killer    = normalize_name(e.get("KillerName", ""))
+        victim    = normalize_name(e.get("VictimName", ""))
+        assisters = [normalize_name(a) for a in parse_assisters(e.get("Assisters"))]
+
+        killer_team = team_map.get(killer)
+        victim_team = team_map.get(victim)
+
+        # Both must be real players on opposite teams
+        if not killer_team or not victim_team:
+            continue
+        if killer_team == victim_team:
+            continue
+
+        # Count players on each side
+        # Killer side: killer + any assisters on killer's team
+        killer_side_players = [killer] + [
+            a for a in assisters if team_map.get(a) == killer_team
+        ]
+        # Victim side: victim + any assisters on victim's team (rare but possible)
+        victim_side_players = [victim] + [
+            a for a in assisters if team_map.get(a) == victim_team
+        ]
+
+        killer_count = len(killer_side_players)
+        victim_count = len(victim_side_players)
+
+        # One side must be exactly 1 (isolated)
+        isolated_count = min(killer_count, victim_count)
+        larger_count   = max(killer_count, victim_count)
+
+        if isolated_count != 1:
+            continue  # Both sides had backup — this is a teamfight
+
+        if larger_count > max_enemy_side:
+            continue  # Other side too large for this threshold
+
+        # Determine which side was isolated
+        if killer_count == 1:
+            isolated_team   = killer_team
+            isolated_player = killer
+            isolated_champ  = champ_map.get(killer, killer)
+            other_team      = victim_team
+            fight_type      = f"1v{victim_count}" if victim_count > 1 else "1v1"
+        else:
+            isolated_team   = victim_team
+            isolated_player = victim
+            isolated_champ  = champ_map.get(victim, victim)
+            other_team      = killer_team
+            fight_type      = f"1v{killer_count}" if killer_count > 1 else "1v1"
+
+        rows.append({
+            "EventTime":       e["EventTime"],
+            "minute":          e["EventTime"] / 60,
+            "killer":          e.get("KillerName", killer),
+            "victim":          e.get("VictimName", victim),
+            "killer_team":     killer_team,
+            "victim_team":     victim_team,
+            "killer_champ":    champ_map.get(killer, killer),
+            "victim_champ":    champ_map.get(victim, victim),
+            "killer_count":    killer_count,
+            "victim_count":    victim_count,
+            "fight_type":      fight_type,
+            "isolated_team":   isolated_team,
+            "isolated_player": isolated_player,
+            "isolated_champ":  isolated_champ,
+            "other_team":      other_team,
+            "assisters":       ", ".join(assisters) if assisters else "—",
+        })
+
+    return pd.DataFrame(rows)
+
+
+def solo_kill_summary(solo_kills, players):
+    """
+    Per-player summary: how many times they were isolated (died alone)
+    and how many times they scored a kill while isolated or with backup.
+    """
+    if solo_kills is None or solo_kills.empty:
+        return pd.DataFrame()
+
+    from collections import defaultdict
+    stats = defaultdict(lambda: {"isolated_deaths": 0, "isolated_kills": 0,
+                                 "assisted_kills": 0})
+
+    for _, row in solo_kills.iterrows():
+        killer = row["killer"]
+        victim = row["victim"]
+        # Was the killer isolated?
+        if row["killer_count"] == 1:
+            stats[killer]["isolated_kills"] += 1
+        else:
+            stats[killer]["assisted_kills"] += 1
+        # Victim was always the one who died — track isolated deaths
+        if row["victim_count"] == 1:
+            stats[victim]["isolated_deaths"] += 1
+
+    rows = []
+    for _, p in players.iterrows():
+        name = p["summonerName"]
+        s    = stats[name]
+        rows.append({
+            "player":           name,
+            "team":             p["team"],
+            "champion":         p.get("champion", name),
+            "isolated_deaths":  s["isolated_deaths"],
+            "isolated_kills":   s["isolated_kills"],
+            "assisted_kills":   s["assisted_kills"],
+            "total":            s["isolated_deaths"] + s["isolated_kills"] + s["assisted_kills"],
+        })
+
+    return pd.DataFrame(rows).sort_values("isolated_deaths", ascending=False)
